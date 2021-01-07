@@ -6,6 +6,7 @@ package cloudwatchlogs
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"strings"
 	"sync"
 	"time"
@@ -28,10 +29,15 @@ const (
 	LogTimestampField = "log_timestamp"
 	LogEntryField     = "value"
 
-	defaultFlushTimeout = 5 * time.Second
-	eventHeaderSize     = 26
-	truncatedSuffix     = "[Truncated...]"
-	msgSizeLimit        = 256*1024 - eventHeaderSize
+	defaultFlushTimeout            = 5 * time.Second
+	pusherCleanupInterval          = 1 * time.Minute
+	pusherExpiryTime               = 1 * time.Minute
+	cleanerCleanInterval           = 50 * time.Millisecond
+	initialObsoletePusherQueueSize = 100
+	finalObsoletePusherQueueSize   = 6400
+	eventHeaderSize                = 26
+	truncatedSuffix                = "[Truncated...]"
+	msgSizeLimit                   = 256*1024 - eventHeaderSize
 
 	maxRetryTimeout    = 14*24*time.Hour + 10*time.Minute
 	metricRetryTimeout = 2 * time.Minute
@@ -57,17 +63,120 @@ type CloudWatchLogs struct {
 
 	Log telegraf.Logger `toml:"-"`
 
-	cwDests map[Target]*cwDest
+	cwDests       map[Target]*cwDest
+	pusherMapLock sync.RWMutex
+
+
+	numPusherEverCreated int64
+
+	obsoletePusherQueue    *ObsoletePusherQueue
+	forcePusherCleanupChan chan bool
+
+	shutdownChan chan bool
+}
+
+func (c *CloudWatchLogs) scanObsoletePusherPeriodically(pusherCleanupInterval time.Duration, pusherExpiryTime time.Duration) {
+	ticker := time.NewTicker(pusherCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			c.scanObsoletePushers(pusherExpiryTime)
+		case <-c.shutdownChan:
+			return
+		}
+	}
+}
+
+func (c *CloudWatchLogs) scanObsoletePushers(pusherExpiryTime time.Duration) {
+	// get the keys first, it can avoid to lock the whole map for long time.
+	c.pusherMapLock.RLock()
+	log.Printf("D! total cwDests: %v", len(c.cwDests))
+	keys := make([]Target, 0, len(c.cwDests))
+	for k := range c.cwDests {
+		keys = append(keys, k)
+	}
+	c.pusherMapLock.RUnlock()
+
+	for _, target := range keys {
+		// skip if multi-logs feature is not used for this pusher
+		c.pusherMapLock.RLock()
+		cd, ok := c.cwDests[target]
+		c.pusherMapLock.RUnlock()
+		if !ok {
+			continue
+		}
+
+		if !cd.MultiLogsEnabled() {
+			continue
+		}
+
+		cd.pusher.pusherLock.Lock()
+		if cd.GetLastUsedTime().Add(pusherExpiryTime).Before(time.Now()) && cd.GetActiveCounter() == 0 {
+			cd.pusher.pusherLock.Unlock()
+			// remove from map and Enqueue
+			c.pusherMapLock.Lock()
+			delete(c.cwDests, target)
+			c.pusherMapLock.Unlock()
+			forceClean := c.obsoletePusherQueue.Enqueue(cd)
+			c.Log.Debug("Delete expired logpusher from map", target)
+			if forceClean {
+				if c.obsoletePusherQueue.GetCurrentSizeLimit() < finalObsoletePusherQueueSize {
+					c.obsoletePusherQueue.DoubleSizeLimit()
+				}
+				c.forcePusherCleanupChan <- true
+			}
+		} else {
+			cd.pusher.pusherLock.Unlock()
+		}
+
+	}
+}
+
+func (c *CloudWatchLogs) cleanupPushers() {
+	ticker := time.NewTicker(cleanerCleanInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			dest, ok := c.obsoletePusherQueue.Dequeue()
+			if ok {
+				c.Log.Debug("Delete dest:", dest.(*cwDest))
+				dest.(*cwDest).Stop(true)
+			} else {
+				c.Log.Debug("Obsolete pusher queue is drained, wait for 1 minute to start next cleanup.")
+				time.Sleep(1 * time.Minute)
+			}
+		case <-c.forcePusherCleanupChan:
+			for i := 0; i < c.obsoletePusherQueue.GetCurrentSizeLimit()/4; i++ {
+				dest, ok := c.obsoletePusherQueue.Dequeue()
+				if ok {
+					dest.(*cwDest).Stop(true)
+				} else {
+					break
+				}
+			}
+		case <-c.shutdownChan:
+			return
+		}
+	}
 }
 
 func (c *CloudWatchLogs) Connect() error {
+	go c.scanObsoletePusherPeriodically(pusherCleanupInterval, pusherExpiryTime)
+	go c.cleanupPushers()
 	return nil
 }
 
 func (c *CloudWatchLogs) Close() error {
+	c.pusherMapLock.RLock()
+	defer c.pusherMapLock.RUnlock()
 	for _, d := range c.cwDests {
-		d.Stop()
+		d.Stop(false)
 	}
+	close(c.shutdownChan)
 	return nil
 }
 
@@ -78,7 +187,7 @@ func (c *CloudWatchLogs) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (c *CloudWatchLogs) CreateDest(group, stream string) logs.LogDest {
+func (c *CloudWatchLogs) CreateDest(group, stream string, multiLogsEnabled bool) logs.LogDest {
 	if group == "" {
 		group = c.LogGroupName
 	}
@@ -90,13 +199,17 @@ func (c *CloudWatchLogs) CreateDest(group, stream string) logs.LogDest {
 		Group:  group,
 		Stream: stream,
 	}
-	return c.getDest(t)
+	return c.getDest(t, multiLogsEnabled)
 }
 
-func (c *CloudWatchLogs) getDest(t Target) *cwDest {
+func (c *CloudWatchLogs) getDest(t Target, multiLogsEnabled bool) *cwDest {
+	c.pusherMapLock.Lock()
 	if cwd, ok := c.cwDests[t]; ok {
+		cwd.SetLastUsedTime(time.Now())
+		cwd.pusherLock.Unlock()
 		return cwd
 	}
+	c.pusherMapLock.Unlock()
 
 	credentialConfig := &configaws.CredentialConfig{
 		Region:    c.Region,
@@ -117,20 +230,26 @@ func (c *CloudWatchLogs) getDest(t Target) *cwDest {
 	client.Handlers.Build.PushBackNamed(handlers.NewRequestCompressionHandler([]string{"PutLogEvents"}))
 	client.Handlers.Build.PushBackNamed(handlers.NewCustomHeaderHandler("User-Agent", agentinfo.UserAgent()))
 
-	pusher := NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log)
+	pusher := NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{}, multiLogsEnabled)
 	cwd := &cwDest{pusher: pusher}
+	c.pusherMapLock.Lock()
+	cwd.SetLastUsedTime(time.Now())
 	c.cwDests[t] = cwd
+	c.pusherMapLock.Unlock()
+	c.numPusherEverCreated += 1
+	c.Log.Debug("[pusherNum]Creating new pusher, total number of pusher ever created is %d", c.numPusherEverCreated)
+
 	return cwd
 }
 
 func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
 	t, err := c.getTargetFromMetric(m)
 	if err != nil {
-		c.Log.Errorf("Failed to find target: %v", err)
+		c.Log.Errorf("Failed to find target: ", err)
 	}
-	cwd := c.getDest(t)
+	cwd := c.getDest(t, false)
 	if cwd == nil {
-		c.Log.Warnf("unable to find log destination, group: %v, stream: %v", t.Group, t.Stream)
+		c.Log.Warnf("unable to find log destination, group:", t.Group, ", stream:",  t.Stream)
 		return
 	}
 	cwd.switchToEMF()
@@ -141,7 +260,7 @@ func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
 		return
 	}
 
-	cwd.AddEvent(e)
+	cwd.AddEvent(e, true)
 }
 
 func (c *CloudWatchLogs) getTargetFromMetric(m telegraf.Metric) (Target, error) {
@@ -255,12 +374,22 @@ func (e *structuredLogEvent) Done() {}
 
 type cwDest struct {
 	*pusher
-	sync.Mutex
+	sync.RWMutex
 	isEMF   bool
 	stopped bool
+	cleanedup bool
 }
 
 func (cd *cwDest) Publish(events []logs.LogEvent) error {
+	cd.RLock()
+	defer cd.RUnlock()
+	if cd.cleanedup {
+		return logs.ErrOutputCleanedup
+	}
+	if cd.stopped {
+		return logs.ErrOutputStopped
+	}
+
 	for _, e := range events {
 		if !cd.isEMF {
 			msg := e.Message()
@@ -268,22 +397,24 @@ func (cd *cwDest) Publish(events []logs.LogEvent) error {
 				cd.switchToEMF()
 			}
 		}
-		cd.AddEvent(e)
-	}
-	if cd.stopped {
-		return logs.ErrOutputStopped
+		cd.AddEvent(e, false)
 	}
 	return nil
 }
 
-func (cd *cwDest) Stop() {
-	cd.pusher.Stop()
+func (cd *cwDest) Stop(isCleanup bool) {
+	cd.Lock()
 	cd.stopped = true
+	cd.cleanedup = isCleanup
+	cd.Unlock()
+	cd.pusher.Stop()
 }
 
-func (cd *cwDest) AddEvent(e logs.LogEvent) {
+func (cd *cwDest) AddEvent(e logs.LogEvent, nonBlocking bool) {
+
 	// Drop events for metric path logs when queue is full
-	if cd.isEMF {
+	// Only use non blocking mode if the event comes from metric path
+	if nonBlocking {
 		cd.pusher.AddEventNonBlocking(e)
 	} else {
 		cd.pusher.AddEvent(e)
@@ -349,8 +480,11 @@ func (c *CloudWatchLogs) SampleConfig() string {
 func init() {
 	outputs.Add("cloudwatchlogs", func() telegraf.Output {
 		return &CloudWatchLogs{
-			ForceFlushInterval: internal.Duration{Duration: defaultFlushTimeout},
-			cwDests:            make(map[Target]*cwDest),
+			ForceFlushInterval:         internal.Duration{Duration: defaultFlushTimeout},
+			cwDests:                    make(map[Target]*cwDest),
+			obsoletePusherQueue:        NewObsoletePusherQueue(initialObsoletePusherQueueSize),
+			forcePusherCleanupChan:     make(chan bool),
+			shutdownChan:               make(chan bool),
 		}
 	})
 }

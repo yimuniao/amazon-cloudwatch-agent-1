@@ -11,6 +11,7 @@ import (
 	"log"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -47,7 +48,7 @@ func (s *svcMock) CreateLogStream(in *cloudwatchlogs.CreateLogStreamInput) (*clo
 
 func TestNewPusher(t *testing.T) {
 	var s svcMock
-	p := NewPusher(Target{"G", "S"}, &s, time.Second, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, time.Second, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	if p.Service != &s {
 		t.Errorf("Pusher service does not match the service passed in")
 	}
@@ -98,7 +99,7 @@ func TestAddSingleEvent(t *testing.T) {
 		}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"MSG", time.Now(), nil})
 
 	if called {
@@ -129,7 +130,7 @@ func TestStopPusherWouldDoFinalSend(t *testing.T) {
 		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: &nst}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"MSG", time.Now(), nil})
 
 	if called {
@@ -168,7 +169,7 @@ func TestLongMessageGetsTruncated(t *testing.T) {
 		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: &nst}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{longMsg, time.Now(), nil})
 	time.Sleep(10 * time.Millisecond)
 	p.send()
@@ -194,7 +195,7 @@ func TestRequestIsLessThan1MB(t *testing.T) {
 		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: &nst}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	for i := 0; i < 8; i++ {
 		p.AddEvent(evtMock{longMsg, time.Now(), nil})
 	}
@@ -219,7 +220,7 @@ func TestRequestIsLessThan10kEvents(t *testing.T) {
 		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: &nst}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	for i := 0; i < 30000; i++ {
 		p.AddEvent(evtMock{msg, time.Now(), nil})
 	}
@@ -244,7 +245,7 @@ func TestTimestampPopulation(t *testing.T) {
 		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: &nst}, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	for i := 0; i < 3; i++ {
 		p.AddEvent(evtMock{"msg", time.Time{}, nil}) // time.Time{} creates zero time
 	}
@@ -268,7 +269,7 @@ func TestIgnoreOutOfTimeRangeEvent(t *testing.T) {
 	var logbuf bytes.Buffer
 	log.SetOutput(io.MultiWriter(&logbuf, os.Stdout))
 
-	p := NewPusher(Target{"G", "S"}, &s, 10*time.Millisecond, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 10*time.Millisecond, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"MSG", time.Now().Add(-15 * 24 * time.Hour), nil})
 	p.AddEvent(evtMock{"MSG", time.Now().Add(2*time.Hour + 1*time.Minute), nil})
 
@@ -326,7 +327,7 @@ func TestAddMultipleEvents(t *testing.T) {
 		evts = append(evts, e)
 	}
 	evts[10], evts[90] = evts[90], evts[10] // make events out of order
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	for _, e := range evts {
 		p.AddEvent(e)
 	}
@@ -380,7 +381,7 @@ func TestSendReqWhenEventsSpanMoreThan24Hrs(t *testing.T) {
 		return nil, nil
 	}
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"MSG 25hrs ago", time.Now().Add(-25 * time.Hour), nil})
 	p.AddEvent(evtMock{"MSG 24hrs ago", time.Now().Add(-24 * time.Hour), nil})
 	p.AddEvent(evtMock{"MSG 23hrs ago", time.Now().Add(-23 * time.Hour), nil})
@@ -408,7 +409,7 @@ func TestUnhandledErrorWouldNotResend(t *testing.T) {
 	var logbuf bytes.Buffer
 	log.SetOutput(io.MultiWriter(&logbuf, os.Stdout))
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"msg", time.Now(), nil})
 	p.FlushTimeout = 10 * time.Millisecond
 	time.Sleep(2000 * time.Millisecond)
@@ -465,7 +466,7 @@ func TestCreateLogGroupAndLogSteamWhenNotFound(t *testing.T) {
 	var logbuf bytes.Buffer
 	log.SetOutput(io.MultiWriter(&logbuf, os.Stdout))
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.AddEvent(evtMock{"msg", time.Now(), nil})
 	time.Sleep(10 * time.Millisecond)
 	p.send()
@@ -495,7 +496,7 @@ func TestCreateLogGroupAndLogSteamWhenNotFound(t *testing.T) {
 
 func TestCreateLogGroupWithError(t *testing.T) {
 	var s svcMock
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 
 	// test normal case. 1. creating stream fails, 2, creating group succeeds, 3, creating stream succeeds.
 	var cnt_clg int
@@ -602,7 +603,8 @@ func TestLogRejectedLogEntryInfo(t *testing.T) {
 	var logbuf bytes.Buffer
 	log.SetOutput(io.MultiWriter(&logbuf, os.Stdout))
 
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
+	p.IncrementActiveCounter()
 	p.AddEvent(evtMock{"msg", time.Now(), nil})
 	time.Sleep(10 * time.Millisecond)
 	p.send()
@@ -656,7 +658,7 @@ func TestAddEventNonBlocking(t *testing.T) {
 		}
 		evts = append(evts, e)
 	}
-	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""))
+	p := NewPusher(Target{"G", "S"}, &s, 1*time.Hour, maxRetryTimeout, models.NewLogger("cloudwatchlogs", "test", ""), &sync.Mutex{}, false)
 	p.FlushTimeout = 10 * time.Millisecond
 	p.resetFlushTimer()
 	time.Sleep(200 * time.Millisecond) // Wait until pusher started, merge channel is blocked

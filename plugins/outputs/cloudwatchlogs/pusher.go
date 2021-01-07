@@ -7,6 +7,7 @@ import (
 	"math/rand"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/amazon-cloudwatch-agent/logs"
@@ -53,9 +54,16 @@ type pusher struct {
 
 	initNonBlockingChOnce sync.Once
 	startNonBlockCh       chan struct{}
+
+	// trace the last time of using pusher
+	lastUsedTime time.Time
+	// activeCounter indicates the number of incoming metric are currently holding this pusher
+	activeCounter    int64
+	pusherLock       *sync.Mutex
+	multiLogsEnabled bool
 }
 
-func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger) *pusher {
+func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger, pusherLock *sync.Mutex, multiLogsEnabled bool) *pusher {
 	p := &pusher{
 		Target:        target,
 		Service:       service,
@@ -63,14 +71,40 @@ func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.D
 		RetryDuration: retryDuration,
 		Log:           logger,
 
-		events:          make([]*cloudwatchlogs.InputLogEvent, 0, 10),
-		eventsCh:        make(chan logs.LogEvent, 100),
-		flushTimer:      time.NewTimer(flushTimeout),
-		stop:            make(chan struct{}),
-		startNonBlockCh: make(chan struct{}),
+		events:           make([]*cloudwatchlogs.InputLogEvent, 0, 10),
+		eventsCh:         make(chan logs.LogEvent, 100),
+		flushTimer:       time.NewTimer(flushTimeout),
+		stop:             make(chan struct{}),
+		startNonBlockCh:  make(chan struct{}),
+		pusherLock:       pusherLock,
+		multiLogsEnabled: multiLogsEnabled,
 	}
 	go p.start()
 	return p
+}
+
+func (p *pusher) GetLastUsedTime() time.Time {
+	return p.lastUsedTime
+}
+
+func (p *pusher) SetLastUsedTime(time time.Time) {
+	p.lastUsedTime = time
+}
+
+func (p *pusher) GetActiveCounter() int64 {
+	return atomic.LoadInt64(&p.activeCounter)
+}
+
+func (p *pusher) IncrementActiveCounter() {
+	atomic.AddInt64(&p.activeCounter, 1)
+}
+
+func (p *pusher) DecrementActiveCounter(publishCounter int64) {
+	atomic.AddInt64(&p.activeCounter, -publishCounter)
+}
+
+func (p *pusher) MultiLogsEnabled() bool {
+	return p.multiLogsEnabled
 }
 
 func (p *pusher) AddEvent(e logs.LogEvent) {
@@ -119,6 +153,7 @@ func hasValidTime(e logs.LogEvent) bool {
 }
 
 func (p *pusher) Stop() {
+	p.flushTimer.Stop()
 	close(p.stop)
 }
 
@@ -130,8 +165,10 @@ func (p *pusher) start() {
 		for {
 			select {
 			case e := <-p.eventsCh:
+				p.IncrementActiveCounter()
 				ec <- e
 			case e := <-p.nonBlockingEventsCh:
+				p.IncrementActiveCounter()
 				ec <- e
 			case <-p.startNonBlockCh:
 			case <-p.stop:
@@ -217,6 +254,19 @@ func (p *pusher) send() {
 		LogStreamName: &p.Stream,
 		SequenceToken: p.sequenceToken,
 	}
+
+	// set the status when it complets the sending.
+	// TODO: If backend is down, pusher for container log will not be deleted.
+	// we may need to add protection logic to prevent the memory increasing when backend is down for container log case.
+	defer func() {
+		p.DecrementActiveCounter(int64(len(input.LogEvents)))
+		p.pusherLock.Lock()
+		defer p.pusherLock.Unlock()
+		p.SetLastUsedTime(time.Now())
+		if p.GetActiveCounter() < 0 {
+			p.Log.Info("[CounterError] active counter is negative %d", p.GetActiveCounter())
+		}
+	}()
 
 	startTime := time.Now()
 

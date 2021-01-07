@@ -99,6 +99,10 @@ func (l *windowsEventLog) Stop() {
 	close(l.done)
 }
 
+func (l *windowsEventLog) PublishMultiLogs() bool {
+	return false
+}
+
 func (l *windowsEventLog) run() {
 	recordNumber := l.eventOffset
 	ticker := time.NewTicker(1 * time.Second)

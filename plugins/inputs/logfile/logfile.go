@@ -152,7 +152,6 @@ func (t *LogFile) FindLogSrc() []logs.LogSrc {
 	// Create a "tailer" for each file
 	for i := range t.FileConfig {
 		fileconfig := &t.FileConfig[i]
-
 		targetFiles, err := t.getTargetFiles(fileconfig)
 		if err != nil {
 			t.Log.Errorf("Failed to find target files for file config %v, with error: %v", fileconfig.FilePath, err)
@@ -237,6 +236,7 @@ func (t *LogFile) FindLogSrc() []logs.LogSrc {
 				fileconfig.Enc,
 				fileconfig.MaxEventSize,
 				fileconfig.TruncateSuffix,
+				fileconfig.PublishMultiLogs,
 			)
 
 			src.AddCleanUpFn(func(ts *tailerSrc) func() {
