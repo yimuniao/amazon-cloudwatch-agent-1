@@ -6,8 +6,10 @@ package cloudwatchlogs
 import (
 	"encoding/json"
 	"fmt"
+	"os"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/amazon-cloudwatch-agent/cfg/agentinfo"
@@ -37,6 +39,10 @@ const (
 	metricRetryTimeout = 2 * time.Minute
 
 	attributesInFields = "attributesInFields"
+
+    permanateRefNum    = 99999
+	pusherCleanupInterval          = 1 * time.Minute
+	pusherExpiryTime               = 1 * time.Minute
 )
 
 type CloudWatchLogs struct {
@@ -58,6 +64,7 @@ type CloudWatchLogs struct {
 	Log telegraf.Logger `toml:"-"`
 
 	cwDests map[Target]*cwDest
+	pusherMapLock sync.Mutex
 }
 
 func (c *CloudWatchLogs) Connect() error {
@@ -65,9 +72,11 @@ func (c *CloudWatchLogs) Connect() error {
 }
 
 func (c *CloudWatchLogs) Close() error {
+	c.pusherMapLock.Lock()
 	for _, d := range c.cwDests {
 		d.Stop()
 	}
+	c.pusherMapLock.Lock()
 	return nil
 }
 
@@ -78,7 +87,7 @@ func (c *CloudWatchLogs) Write(metrics []telegraf.Metric) error {
 	return nil
 }
 
-func (c *CloudWatchLogs) CreateDest(group, stream string) logs.LogDest {
+func (c *CloudWatchLogs) CreateDest(group, stream string, multiLogsEnabled bool) logs.LogDest {
 	if group == "" {
 		group = c.LogGroupName
 	}
@@ -87,16 +96,24 @@ func (c *CloudWatchLogs) CreateDest(group, stream string) logs.LogDest {
 	}
 
 	t := Target{
-		Group:  group,
-		Stream: stream,
+		Group:            group,
+		Stream:           stream,
+		multiLogsEnabled: multiLogsEnabled,
 	}
-	return c.getDest(t)
+	dest, isNew := c.getDest(t)
+	if !isNew {
+		atomic.AddInt64(&dest.refNum, 1)
+	}
+	return dest
 }
 
-func (c *CloudWatchLogs) getDest(t Target) *cwDest {
+func (c *CloudWatchLogs) getDest(t Target) (*cwDest, bool) {
+	c.pusherMapLock.Lock()
 	if cwd, ok := c.cwDests[t]; ok {
-		return cwd
+		c.pusherMapLock.Unlock()
+		return cwd, false
 	}
+	c.pusherMapLock.Unlock()
 
 	credentialConfig := &configaws.CredentialConfig{
 		Region:    c.Region,
@@ -117,10 +134,43 @@ func (c *CloudWatchLogs) getDest(t Target) *cwDest {
 	client.Handlers.Build.PushBackNamed(handlers.NewRequestCompressionHandler([]string{"PutLogEvents"}))
 	client.Handlers.Build.PushBackNamed(handlers.NewCustomHeaderHandler("User-Agent", agentinfo.UserAgent()))
 
-	pusher := NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log)
-	cwd := &cwDest{pusher: pusher}
+	pusher := NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{})
+	_, err := os.Stat("/tmp/test_real_backend")
+	if err != nil {
+		pusher = NewPusher(t, &svcMockT{}, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{})
+	}
+
+	cwd := &cwDest{pusher: pusher, refNum: 1}
+	c.pusherMapLock.Lock()
 	c.cwDests[t] = cwd
-	return cwd
+	c.pusherMapLock.Unlock()
+	return cwd, true
+}
+
+func (c *CloudWatchLogs) RemoveDest(group string, stream string, isPublishMultiLogs bool) {
+	if !isPublishMultiLogs {
+		return
+	}
+
+	t := Target{
+		Group:            group,
+		Stream:           stream,
+		multiLogsEnabled: true,
+	}
+	c.pusherMapLock.Lock()
+	defer c.pusherMapLock.Unlock()
+	dest, ok := c.cwDests[t]
+	if !ok {
+		c.Log.Errorf("E! Failed to find destination for target: %v", t)
+		return
+	}
+
+	atomic.AddInt64(&dest.refNum, -1)
+	refNum := atomic.LoadInt64(&dest.refNum)
+	if refNum == 0 {
+		delete(c.cwDests, t)
+		go dest.stopping(pusherCleanupInterval, pusherExpiryTime)
+	}
 }
 
 func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
@@ -128,11 +178,14 @@ func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
 	if err != nil {
 		c.Log.Errorf("Failed to find target: %v", err)
 	}
-	cwd := c.getDest(t)
+	cwd,_ := c.getDest(t)
 	if cwd == nil {
 		c.Log.Warnf("unable to find log destination, group: %v, stream: %v", t.Group, t.Stream)
 		return
 	}
+	// set a static value to refNum, it means it is always been referenced.
+	atomic.StoreInt64(&cwd.refNum, permanateRefNum)
+
 	cwd.switchToEMF()
 	cwd.pusher.RetryDuration = metricRetryTimeout
 
@@ -160,7 +213,7 @@ func (c *CloudWatchLogs) getTargetFromMetric(m telegraf.Metric) (Target, error) 
 		logStream = c.LogStreamName
 	}
 
-	return Target{logGroup, logStream}, nil
+	return Target{logGroup, logStream, false}, nil
 }
 
 func (c *CloudWatchLogs) getLogEventFromMetric(metric telegraf.Metric) *structuredLogEvent {
@@ -255,9 +308,10 @@ func (e *structuredLogEvent) Done() {}
 
 type cwDest struct {
 	*pusher
-	sync.Mutex
+	sync.RWMutex
 	isEMF   bool
 	stopped bool
+	refNum  int64
 }
 
 func (cd *cwDest) Publish(events []logs.LogEvent) error {
@@ -270,6 +324,9 @@ func (cd *cwDest) Publish(events []logs.LogEvent) error {
 		}
 		cd.AddEvent(e)
 	}
+
+	cd.RLock()
+	defer cd.RUnlock()
 	if cd.stopped {
 		return logs.ErrOutputStopped
 	}
@@ -277,8 +334,28 @@ func (cd *cwDest) Publish(events []logs.LogEvent) error {
 }
 
 func (cd *cwDest) Stop() {
+	cd.Lock()
+	defer cd.Unlock()
 	cd.pusher.Stop()
 	cd.stopped = true
+}
+
+func (cd *cwDest) stopping(pusherCleanupInterval time.Duration, pusherExpiryTime time.Duration) {
+	ticker := time.NewTicker(pusherCleanupInterval)
+	defer ticker.Stop()
+
+	for {
+		select {
+		case <-ticker.C:
+			if cd.GetLastUsedTime().Add(pusherExpiryTime).Before(time.Now()) && cd.GetActiveCounter() == 0 {
+				cd.Lock()
+				cd.stopped = true
+				cd.Unlock()
+				cd.pusher.Stop()
+				return
+			}
+		}
+	}
 }
 
 func (cd *cwDest) AddEvent(e logs.LogEvent) {
@@ -310,7 +387,8 @@ func (cd *cwDest) setRetryer(r request.Retryer) {
 }
 
 type Target struct {
-	Group, Stream string
+	Group, Stream    string
+	multiLogsEnabled bool
 }
 
 // Description returns a one-sentence description on the Output

@@ -73,6 +73,7 @@ type tailerSrc struct {
 	done            chan struct{}
 	startTailerOnce sync.Once
 	cleanUpFns      []func()
+	publishMultiLogs bool
 }
 
 func NewTailerSrc(
@@ -84,6 +85,7 @@ func NewTailerSrc(
 	enc encoding.Encoding,
 	maxEventSize int,
 	truncateSuffix string,
+	publishMultiLogs bool,
 ) *tailerSrc {
 	ts := &tailerSrc{
 		group:          group,
@@ -100,6 +102,7 @@ func NewTailerSrc(
 
 		offsetCh: make(chan fileOffset, 2000),
 		done:     make(chan struct{}),
+		publishMultiLogs: publishMultiLogs,
 	}
 	go ts.runSaveState()
 	return ts
@@ -127,6 +130,10 @@ func (ts tailerSrc) Description() string {
 
 func (ts tailerSrc) Destination() string {
 	return ts.destination
+}
+
+func (ts tailerSrc) PublishMultiLogs() bool {
+	return ts.publishMultiLogs
 }
 
 func (ts tailerSrc) Done(offset fileOffset) {

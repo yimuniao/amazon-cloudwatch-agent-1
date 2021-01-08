@@ -34,12 +34,14 @@ type LogSrc interface {
 	Destination() string
 	Description() string
 	Stop()
+	PublishMultiLogs() bool
 }
 
 // A LogBackend is able to return a LogDest of a given name.
 // The same name should always return the same LogDest.
 type LogBackend interface {
-	CreateDest(string, string) LogDest
+	CreateDest(string, string, bool) LogDest
+	RemoveDest(string, string, bool)
 }
 
 // A LogDest represents a final endpoint where log events are published to.
@@ -52,16 +54,21 @@ type LogDest interface {
 type LogAgent struct {
 	Config      *config.Config
 	backends    map[string]LogBackend
-	destNames   map[LogDest]string
 	collections []LogCollection
 }
 
 func NewLogAgent(c *config.Config) *LogAgent {
 	return &LogAgent{
-		Config:    c,
-		backends:  make(map[string]LogBackend),
-		destNames: make(map[LogDest]string),
+		Config:   c,
+		backends: make(map[string]LogBackend),
 	}
+}
+
+// LogAgent is the agent handles pure log pipelines
+type destinationTarget struct {
+	src     LogSrc
+	dest    LogDest
+	backend LogBackend
 }
 
 // LogAgent will scan all input and output plugins for LogCollection and LogBackend.
@@ -91,9 +98,13 @@ func (l *LogAgent) Run(ctx context.Context) {
 
 	t := time.NewTicker(time.Second)
 	defer t.Stop()
+
 	for {
 		select {
 		case <-t.C:
+			// TODO: check how many multi logs files are monitored, if it exceeds the maximum, we should stop scanning,
+			// Otherwise, when backend is down, it will use up all of the memory.
+
 			for _, c := range l.collections {
 				srcs := c.FindLogSrc()
 				for _, src := range srcs {
@@ -103,10 +114,10 @@ func (l *LogAgent) Run(ctx context.Context) {
 						log.Printf("E! [logagent] Failed to find destination %v for log source %v/%v(%v) ", dname, src.Group(), src.Stream(), src.Description())
 						continue
 					}
-					dest := backend.CreateDest(src.Group(), src.Stream())
-					l.destNames[dest] = dname
+					dest := backend.CreateDest(src.Group(), src.Stream(), src.PublishMultiLogs())
 					log.Printf("I! [logagent] piping log from %v/%v(%v) to %v", src.Group(), src.Stream(), src.Description(), dname)
-					go l.runSrcToDest(src, dest)
+
+					go l.runSrcToDest(&destinationTarget{src: src, dest: dest, backend: backend})
 				}
 			}
 		case <-ctx.Done():
@@ -115,10 +126,11 @@ func (l *LogAgent) Run(ctx context.Context) {
 	}
 }
 
-func (l *LogAgent) runSrcToDest(src LogSrc, dest LogDest) {
+func (l *LogAgent) runSrcToDest(destTarget *destinationTarget) {
+	src := destTarget.src
+	dest := destTarget.dest
 	eventsCh := make(chan LogEvent)
 	defer src.Stop()
-
 	src.SetOutput(func(e LogEvent) {
 		if e == nil {
 			close(eventsCh)
@@ -128,15 +140,23 @@ func (l *LogAgent) runSrcToDest(src LogSrc, dest LogDest) {
 		eventsCh <- e
 	})
 
+	defer l.removeDest(destTarget)
+
 	for e := range eventsCh {
 		err := dest.Publish([]LogEvent{e})
+
 		if err == ErrOutputStopped {
-			log.Printf("I! [logagent] Log destination %v has stopped, finalizing %v/%v", l.destNames[dest], src.Group(), src.Stream())
+			log.Printf("I! [logagent] Log destination %v has stopped, finalizing %v/%v", src.Destination(), src.Group(), src.Stream())
 			return
 		}
 		if err != nil {
-			log.Printf("E! [logagent] Failed to publish log to %v, error: %v", l.destNames[dest], err)
+			log.Printf("E! [logagent] Failed to publish log to %v, error: %v", src.Destination(), err)
 			return
 		}
 	}
+}
+
+func (l *LogAgent) removeDest(destTarget *destinationTarget) {
+	log.Printf("D! ==try to remove destion: %+v", *destTarget)
+	destTarget.backend.RemoveDest(destTarget.src.Group(), destTarget.src.Stream(), destTarget.src.PublishMultiLogs())
 }

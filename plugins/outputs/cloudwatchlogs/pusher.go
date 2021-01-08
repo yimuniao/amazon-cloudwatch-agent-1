@@ -5,8 +5,10 @@ package cloudwatchlogs
 
 import (
 	"math/rand"
+	"os"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/aws/amazon-cloudwatch-agent/logs"
@@ -53,9 +55,43 @@ type pusher struct {
 
 	initNonBlockingChOnce sync.Once
 	startNonBlockCh       chan struct{}
+
+	// trace the last time of using pusher
+	lastUsedTime time.Time
+	// activeCounter indicates the number of incoming metric are currently holding this pusher
+	activeCounter    int64
+	pusherLock       *sync.Mutex
+	multiLogsEnabled bool
 }
 
-func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger) *pusher {
+type svcMockT struct {
+	ple func(*cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error)
+	clg func(input *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error)
+	cls func(input *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error)
+}
+
+func (s *svcMockT) PutLogEvents(in *cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error) {
+	_, err := os.Stat("/tmp/test_flag")
+	if err == nil {
+		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: nil}, nil
+
+	}
+	return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: nil}, &cloudwatchlogs.LimitExceededException{}
+}
+func (s *svcMockT) CreateLogGroup(in *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error) {
+	if s.clg != nil {
+		return s.clg(in)
+	}
+	return nil, nil
+}
+func (s *svcMockT) CreateLogStream(in *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error) {
+	if s.cls != nil {
+		return s.cls(in)
+	}
+	return nil, nil
+}
+
+func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger, pusherLock *sync.Mutex) *pusher {
 	p := &pusher{
 		Target:        target,
 		Service:       service,
@@ -63,14 +99,40 @@ func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.D
 		RetryDuration: retryDuration,
 		Log:           logger,
 
-		events:          make([]*cloudwatchlogs.InputLogEvent, 0, 10),
-		eventsCh:        make(chan logs.LogEvent, 100),
-		flushTimer:      time.NewTimer(flushTimeout),
-		stop:            make(chan struct{}),
-		startNonBlockCh: make(chan struct{}),
+		events:           make([]*cloudwatchlogs.InputLogEvent, 0, 10),
+		eventsCh:         make(chan logs.LogEvent, 100),
+		flushTimer:       time.NewTimer(flushTimeout),
+		stop:             make(chan struct{}),
+		startNonBlockCh:  make(chan struct{}),
+		pusherLock:       pusherLock,
+		multiLogsEnabled: target.multiLogsEnabled,
 	}
 	go p.start()
 	return p
+}
+
+func (p *pusher) GetLastUsedTime() time.Time {
+	return p.lastUsedTime
+}
+
+func (p *pusher) SetLastUsedTime(time time.Time) {
+	p.lastUsedTime = time
+}
+
+func (p *pusher) GetActiveCounter() int64 {
+	return atomic.LoadInt64(&p.activeCounter)
+}
+
+func (p *pusher) IncrementActiveCounter() {
+	atomic.AddInt64(&p.activeCounter, 1)
+}
+
+func (p *pusher) DecrementActiveCounter(publishCounter int64) {
+	atomic.AddInt64(&p.activeCounter, -publishCounter)
+}
+
+func (p *pusher) MultiLogsEnabled() bool {
+	return p.multiLogsEnabled
 }
 
 func (p *pusher) AddEvent(e logs.LogEvent) {
@@ -119,6 +181,7 @@ func hasValidTime(e logs.LogEvent) bool {
 }
 
 func (p *pusher) Stop() {
+	p.flushTimer.Stop()
 	close(p.stop)
 }
 
@@ -130,8 +193,10 @@ func (p *pusher) start() {
 		for {
 			select {
 			case e := <-p.eventsCh:
+				p.IncrementActiveCounter()
 				ec <- e
 			case e := <-p.nonBlockingEventsCh:
+				p.IncrementActiveCounter()
 				ec <- e
 			case <-p.startNonBlockCh:
 			case <-p.stop:
@@ -217,6 +282,16 @@ func (p *pusher) send() {
 		LogStreamName: &p.Stream,
 		SequenceToken: p.sequenceToken,
 	}
+
+	defer func() {
+		p.DecrementActiveCounter(int64(len(input.LogEvents)))
+		p.pusherLock.Lock()
+		defer p.pusherLock.Unlock()
+		p.SetLastUsedTime(time.Now())
+		if p.GetActiveCounter() < 0 {
+			p.Log.Info("[CounterError] active counter is negative %d", p.GetActiveCounter())
+		}
+	}()
 
 	startTime := time.Now()
 

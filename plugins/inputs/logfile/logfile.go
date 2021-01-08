@@ -237,6 +237,7 @@ func (t *LogFile) FindLogSrc() []logs.LogSrc {
 				fileconfig.Enc,
 				fileconfig.MaxEventSize,
 				fileconfig.TruncateSuffix,
+				fileconfig.PublishMultiLogs,
 			)
 
 			src.AddCleanUpFn(func(ts *tailerSrc) func() {
