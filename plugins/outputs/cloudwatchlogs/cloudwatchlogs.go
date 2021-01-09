@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"os"
 	"strings"
 	"sync"
 	"time"
@@ -230,7 +231,14 @@ func (c *CloudWatchLogs) getDest(t Target, multiLogsEnabled bool) *cwDest {
 	client.Handlers.Build.PushBackNamed(handlers.NewRequestCompressionHandler([]string{"PutLogEvents"}))
 	client.Handlers.Build.PushBackNamed(handlers.NewCustomHeaderHandler("User-Agent", agentinfo.UserAgent()))
 
-	pusher := NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{}, multiLogsEnabled)
+    var pusher *pusher
+	_, err := os.Stat("/tmp/test_real_backend")
+	if err != nil {
+		pusher = NewPusher(t, &svcMockT{}, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{}, multiLogsEnabled)
+	} else {
+		pusher = NewPusher(t, client, c.ForceFlushInterval.Duration, maxRetryTimeout, c.Log, &sync.Mutex{}, multiLogsEnabled)
+	}
+
 	cwd := &cwDest{pusher: pusher}
 	c.pusherMapLock.Lock()
 	cwd.SetLastUsedTime(time.Now())

@@ -5,6 +5,7 @@ package cloudwatchlogs
 
 import (
 	"math/rand"
+	"os"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -61,6 +62,33 @@ type pusher struct {
 	activeCounter    int64
 	pusherLock       *sync.Mutex
 	multiLogsEnabled bool
+}
+
+type svcMockT struct {
+	ple func(*cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error)
+	clg func(input *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error)
+	cls func(input *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error)
+}
+
+func (s *svcMockT) PutLogEvents(in *cloudwatchlogs.PutLogEventsInput) (*cloudwatchlogs.PutLogEventsOutput, error) {
+	_, err := os.Stat("/tmp/test_flag")
+	if err == nil {
+		return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: nil}, nil
+
+	}
+	return &cloudwatchlogs.PutLogEventsOutput{NextSequenceToken: nil}, &cloudwatchlogs.LimitExceededException{}
+}
+func (s *svcMockT) CreateLogGroup(in *cloudwatchlogs.CreateLogGroupInput) (*cloudwatchlogs.CreateLogGroupOutput, error) {
+	if s.clg != nil {
+		return s.clg(in)
+	}
+	return nil, nil
+}
+func (s *svcMockT) CreateLogStream(in *cloudwatchlogs.CreateLogStreamInput) (*cloudwatchlogs.CreateLogStreamOutput, error) {
+	if s.cls != nil {
+		return s.cls(in)
+	}
+	return nil, nil
 }
 
 func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger, pusherLock *sync.Mutex, multiLogsEnabled bool) *pusher {
