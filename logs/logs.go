@@ -13,7 +13,7 @@ import (
 )
 
 const (
-	maxCachedEvents = 10000 * 10
+	maxCachedEvents = 100 * 500
 )
 
 var ErrOutputStopped = errors.New("Output plugin stopped")
