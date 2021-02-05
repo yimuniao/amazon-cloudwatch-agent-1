@@ -242,6 +242,17 @@ func (c *CloudWatchLogs) getDest(t Target, multiLogsEnabled bool) *cwDest {
 	return cwd
 }
 
+func (c *CloudWatchLogs)TotalCachedEvents() int64 {
+	c.pusherMapLock.RLock()
+	defer c.pusherMapLock.RUnlock()
+	totalLength := int64(0)
+	for _,v := range c.cwDests {
+		totalLength += int64(len(v.eventsCh))
+	}
+
+	return totalLength
+}
+
 func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
 	t, err := c.getTargetFromMetric(m)
 	if err != nil {

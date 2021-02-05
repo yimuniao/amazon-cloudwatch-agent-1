@@ -12,6 +12,10 @@ import (
 	"github.com/influxdata/telegraf/config"
 )
 
+const (
+	maxCachedEvents = 10000 * 10
+)
+
 var ErrOutputStopped = errors.New("Output plugin stopped")
 var ErrOutputCleanedup = errors.New("Output plugin ErrOutputCleanedup")
 
@@ -42,6 +46,7 @@ type LogSrc interface {
 // The same name should always return the same LogDest.
 type LogBackend interface {
 	CreateDest(string, string, bool) LogDest
+	TotalCachedEvents() int64
 }
 
 // A LogDest represents a final endpoint where log events are published to.
@@ -94,6 +99,19 @@ func (l *LogAgent) Run(ctx context.Context) {
 	for {
 		select {
 		case <-t.C:
+			// If the number of cached events exceeds the maximum, we should stop scanning,
+			// Otherwise, when backend is down, in special case, it will use up all of the memory.
+			totalCachedEvents := int64(0)
+			for _, backend := range l.backends {
+				totalCachedEvents += backend.TotalCachedEvents()
+			}
+
+			log.Printf("D! totalCachedEvents: %v", totalCachedEvents)
+			if totalCachedEvents >= maxCachedEvents {
+				log.Printf("E!  totalCachedEvents exceeds the maxCachedEvents, skip the sanning.")
+				break
+			}
+
 			for _, c := range l.collections {
 				srcs := c.FindLogSrc()
 				for _, src := range srcs {
