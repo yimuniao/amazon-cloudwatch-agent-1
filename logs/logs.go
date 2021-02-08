@@ -12,6 +12,9 @@ import (
 	"github.com/influxdata/telegraf/config"
 )
 
+const (
+	maxCachedEvents = 10000 * 10
+)
 var ErrOutputStopped = errors.New("Output plugin stopped")
 
 // A LogCollection is a collection of LogSrc, a plugin which can provide many LogSrc
@@ -42,6 +45,7 @@ type LogSrc interface {
 type LogBackend interface {
 	CreateDest(string, string, bool) LogDest
 	RemoveDest(string, string, bool)
+	TotalLength() int64
 }
 
 // A LogDest represents a final endpoint where log events are published to.
@@ -102,8 +106,18 @@ func (l *LogAgent) Run(ctx context.Context) {
 	for {
 		select {
 		case <-t.C:
-			// TODO: check how many multi logs files are monitored, if it exceeds the maximum, we should stop scanning,
+			// If the number of cached events exceeds the maximum, we should stop scanning,
 			// Otherwise, when backend is down, it will use up all of the memory.
+			totalCachedEvents := int64(0)
+			for _, backend := range l.backends {
+				totalCachedEvents += backend.TotalLength()
+			}
+
+			log.Printf("I! ===== totalCachedEvents: %v", totalCachedEvents)
+			if totalCachedEvents >= maxCachedEvents {
+				log.Printf("E!  totalCachedEvents exceeds the maxCachedEvents, skip the sanning.")
+				break
+			}
 
 			for _, c := range l.collections {
 				srcs := c.FindLogSrc()
@@ -157,6 +171,6 @@ func (l *LogAgent) runSrcToDest(destTarget *destinationTarget) {
 }
 
 func (l *LogAgent) removeDest(destTarget *destinationTarget) {
-	log.Printf("D! ==try to remove destion: %+v", *destTarget)
+	log.Printf("I! try to remove destion: %+v", *destTarget)
 	destTarget.backend.RemoveDest(destTarget.src.Group(), destTarget.src.Stream(), destTarget.src.PublishMultiLogs())
 }

@@ -67,7 +67,7 @@ func startAgent(writer io.WriteCloser) error {
 
 	// linux command has pid passed while windows does not
 	agentCmd := []string{agentBinaryPath, "-config", tomlConfigPath, "-envconfig", envConfigPath,
-		"-pidfile", AGENT_DIR_LINUX + "/var/amazon-cloudwatch-agent.pid"}
+		"-pidfile", AGENT_DIR_LINUX + "/var/amazon-cloudwatch-agent.pid", "--pprof-addr", "localhost:6060"}
 	if err = syscall.Exec(name, agentCmd, os.Environ()); err != nil {
 		// log file is closed, so use fmt here
 		fmt.Printf("E! Exec failed: %v \n", err)

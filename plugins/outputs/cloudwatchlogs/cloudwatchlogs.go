@@ -6,6 +6,7 @@ package cloudwatchlogs
 import (
 	"encoding/json"
 	"fmt"
+	"log"
 	"os"
 	"strings"
 	"sync"
@@ -65,6 +66,7 @@ type CloudWatchLogs struct {
 
 	cwDests map[Target]*cwDest
 	pusherMapLock sync.Mutex
+	stoppingCWDestNum int64
 }
 
 func (c *CloudWatchLogs) Connect() error {
@@ -169,8 +171,22 @@ func (c *CloudWatchLogs) RemoveDest(group string, stream string, isPublishMultiL
 	refNum := atomic.LoadInt64(&dest.refNum)
 	if refNum == 0 {
 		delete(c.cwDests, t)
-		go dest.stopping(pusherCleanupInterval, pusherExpiryTime)
+		atomic.AddInt64(&c.stoppingCWDestNum, 1)
+		go dest.stopping(pusherCleanupInterval, pusherExpiryTime, c)
 	}
+}
+
+func (c *CloudWatchLogs)TotalLength() int64 {
+	c.pusherMapLock.Lock()
+	defer c.pusherMapLock.Unlock()
+	totalLength := int64(0)
+	for _,v := range c.cwDests {
+		totalLength += int64(len(v.eventsCh))
+	}
+	stoppingCWDestNum := atomic.LoadInt64(&c.stoppingCWDestNum)
+	estimatedEventsNum := stoppingCWDestNum * (lengthOfEventsCh/2)
+	log.Printf("I! =====stoppingCWDestNum: %v,  estimatedEventsNum: %v", stoppingCWDestNum, estimatedEventsNum)
+	return totalLength + estimatedEventsNum
 }
 
 func (c *CloudWatchLogs) writeMetricAsStructuredLog(m telegraf.Metric) {
@@ -340,10 +356,10 @@ func (cd *cwDest) Stop() {
 	cd.stopped = true
 }
 
-func (cd *cwDest) stopping(pusherCleanupInterval time.Duration, pusherExpiryTime time.Duration) {
-	ticker := time.NewTicker(pusherCleanupInterval)
+func (cd *cwDest) stopping(pusherCleanupInterval time.Duration, pusherExpiryTime time.Duration, c *CloudWatchLogs) {
+	ticker := time.NewTicker(time.Duration(seededRand.Int63n(int64(pusherCleanupInterval/10)) + int64(pusherCleanupInterval * 9/10)))
 	defer ticker.Stop()
-
+	defer atomic.AddInt64(&c.stoppingCWDestNum, -1)
 	for {
 		select {
 		case <-ticker.C:
@@ -352,6 +368,7 @@ func (cd *cwDest) stopping(pusherCleanupInterval time.Duration, pusherExpiryTime
 				cd.stopped = true
 				cd.Unlock()
 				cd.pusher.Stop()
+				log.Printf("I! cwDest stopped: %v/%v", cd.Group, cd.Stream)
 				return
 			}
 		}

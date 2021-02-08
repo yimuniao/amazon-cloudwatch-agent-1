@@ -21,6 +21,7 @@ import (
 const (
 	reqSizeLimit   = 1024 * 1024
 	reqEventsLimit = 10000
+    lengthOfEventsCh = 100
 )
 
 var (
@@ -92,6 +93,7 @@ func (s *svcMockT) CreateLogStream(in *cloudwatchlogs.CreateLogStreamInput) (*cl
 }
 
 func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.Duration, retryDuration time.Duration, logger telegraf.Logger, pusherLock *sync.Mutex) *pusher {
+
 	p := &pusher{
 		Target:        target,
 		Service:       service,
@@ -100,7 +102,7 @@ func NewPusher(target Target, service CloudWatchLogsService, flushTimeout time.D
 		Log:           logger,
 
 		events:           make([]*cloudwatchlogs.InputLogEvent, 0, 10),
-		eventsCh:         make(chan logs.LogEvent, 100),
+		eventsCh:         make(chan logs.LogEvent, lengthOfEventsCh),
 		flushTimer:       time.NewTimer(flushTimeout),
 		stop:             make(chan struct{}),
 		startNonBlockCh:  make(chan struct{}),
