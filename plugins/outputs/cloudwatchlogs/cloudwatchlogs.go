@@ -204,13 +204,16 @@ func (c *CloudWatchLogs) CreateDest(group, stream string, multiLogsEnabled bool)
 }
 
 func (c *CloudWatchLogs) getDest(t Target, multiLogsEnabled bool) *cwDest {
-	c.pusherMapLock.Lock()
+	c.pusherMapLock.RLock()
 	if cwd, ok := c.cwDests[t]; ok {
+		c.pusherMapLock.RUnlock()
+
+		cwd.pusherLock.Lock()
 		cwd.SetLastUsedTime(time.Now())
 		cwd.pusherLock.Unlock()
 		return cwd
 	}
-	c.pusherMapLock.Unlock()
+	c.pusherMapLock.RUnlock()
 
 	credentialConfig := &configaws.CredentialConfig{
 		Region:    c.Region,
